@@ -1,9 +1,9 @@
-﻿using System.Collections.Frozen;
-using System.Collections.Immutable;
-using System.Diagnostics;
-using data_mover.ColumnProcessors;
+﻿using data_mover.ColumnProcessors;
 using Npgsql;
 using Npgsql.Schema;
+using System.Collections.Frozen;
+using System.Collections.Immutable;
+using System.Diagnostics;
 using Tomlyn;
 using Tomlyn.Model;
 
@@ -63,22 +63,23 @@ static class Program
         var tablesColumns = reader.GetColumnSchema().ToImmutableArray();
 
         Console.WriteLine($"Starting table {table.Table}.");
-        long count = 0;
         var sinceLastReport = Stopwatch.StartNew();
         var totalTime = Stopwatch.StartNew();
+
+        var rows = new List<Dictionary<string, object>>();
+
         while (reader.Read())
         {
             var row = ReadRow(reader, tablesColumns);
             ProcessRow(row, columnsToProcess);
-            WriteRow(row, table.Table, tablesColumns, destinationConnection);
-
-            count += 1;
-            if (sinceLastReport.Elapsed.TotalSeconds > 10)
-            {
-                Console.WriteLine($"Processing {table.Table} for {totalTime.Elapsed.TotalSeconds}s at row number {count}.");
-                sinceLastReport.Restart();
-            }
+            rows.Add(row);            
         }
+
+        if (rows.Any())
+        {
+            WriteRows(rows, table.Table, tablesColumns, destinationConnection, sinceLastReport, totalTime);
+        }
+
         Console.WriteLine($"Table {table} processed in: " + totalTime.Elapsed.TotalSeconds + "s");
     }
 
@@ -103,25 +104,29 @@ static class Program
         }
     }
 
-    private static void WriteRow(Dictionary<string, object> row, DatabaseTable table, IReadOnlyList<NpgsqlDbColumn> columns, NpgsqlConnection destinationConnection)
+    private static void WriteRows(IEnumerable<Dictionary<string, object>> rows, DatabaseTable table, IReadOnlyList<NpgsqlDbColumn> columns, NpgsqlConnection destinationConnection, Stopwatch sinceLastReport, Stopwatch totalTime)
     {
-        using var command = destinationConnection.CreateCommand();
-        var parameterNames = string.Join(", ", Enumerable.Range(1, row.Count).Select(x => $"${x}"));
-        command.CommandText = "INSERT INTO " + table + $" VALUES ({parameterNames})";
+        long count = 0;
 
-        foreach (var column in columns)
-        {
-            var parameter = command.CreateParameter();
-            parameter.Value = row[column.ColumnName];
-            command.Parameters.Add(parameter);
-        }
-        command.Prepare();
+        using var writer = destinationConnection.BeginBinaryImport($"COPY {table} ({string.Join(", ", columns.Select(c => c.ColumnName))}) FROM STDIN (FORMAT BINARY)");
 
-        var result = command.ExecuteNonQuery();
-        if (result != 1)
+        foreach (var row in rows)
         {
-            throw new InvalidOperationException("No rows inserted!");
+            writer.StartRow();
+            foreach (var column in columns)
+            {
+                writer.Write(row[column.ColumnName]);
+            }
+
+            count += 1;
+            if (sinceLastReport.Elapsed.TotalSeconds > 10)
+            {
+                Console.WriteLine($"Processing {table.Table} for {totalTime.Elapsed.TotalSeconds}s at row number {count}.");
+                sinceLastReport.Restart();
+            }
         }
+
+        writer.Complete();
     }
 
     private static void TruncateDestinationDatabaseTables(IReadOnlyList<TableConfiguration> tablesToProcess, DbConfig destinationDbConfig)
