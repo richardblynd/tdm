@@ -1,9 +1,10 @@
-﻿using System.Collections.Frozen;
-using System.Collections.Immutable;
-using System.Diagnostics;
-using data_mover.ColumnProcessors;
+﻿using data_mover.ColumnProcessors;
 using Npgsql;
 using Npgsql.Schema;
+using System.Collections.Frozen;
+using System.Collections.Immutable;
+using System.Diagnostics;
+using System.Threading.Channels;
 using Tomlyn;
 using Tomlyn.Model;
 
@@ -11,7 +12,7 @@ namespace data_mover;
 
 static class Program
 {
-    public static int Main(string[] args)
+    public static async Task<int> Main(string[] args)
     {
         var config = ReadConfig(args);
         if (config is null)
@@ -31,23 +32,23 @@ static class Program
         TruncateDestinationDatabaseTables(tablesToProcess, destinationDbConfig);
 
         // process the tables.
-        ProcessTables(tablesToProcess, columnsToProcess, sourceDbConfig, destinationDbConfig);
+        await ProcessTables(tablesToProcess, columnsToProcess, sourceDbConfig, destinationDbConfig);
 
         return 0;
     }
 
-    private static void ProcessTables(IReadOnlyList<TableConfiguration> tablesToProcess, IReadOnlyDictionary<DatabaseColumn, IColumnProcessor> columnsToProcess, DbConfig sourceDbConfig, DbConfig destinationDbConfig)
+    private static async Task ProcessTables(IReadOnlyList<TableConfiguration> tablesToProcess, IReadOnlyDictionary<DatabaseColumn, IColumnProcessor> columnsToProcess, DbConfig sourceDbConfig, DbConfig destinationDbConfig)
     {
         var totalStopWatch = Stopwatch.StartNew();
         foreach (var table in tablesToProcess)
         {
             var columns = columnsToProcess.Where(c => c.Key.Table == table.Table).ToFrozenDictionary();
-            ProcessTable(table, columns, sourceDbConfig, destinationDbConfig);
+            await ProcessTable(table, columns, sourceDbConfig, destinationDbConfig);
         }
         Console.WriteLine("Total time processing tables: " + totalStopWatch.Elapsed.TotalSeconds + "s");
     }
 
-    private static void ProcessTable(TableConfiguration table, IReadOnlyDictionary<DatabaseColumn, IColumnProcessor> columnsToProcess, DbConfig sourceDbConfig, DbConfig destinationDbConfig)
+    private static async Task ProcessTable(TableConfiguration table, IReadOnlyDictionary<DatabaseColumn, IColumnProcessor> columnsToProcess, DbConfig sourceDbConfig, DbConfig destinationDbConfig)
     {
         using var sourceConnection = sourceDbConfig.Connection();
         sourceConnection.Open();
@@ -63,23 +64,97 @@ static class Program
         var tablesColumns = reader.GetColumnSchema().ToImmutableArray();
 
         Console.WriteLine($"Starting table {table.Table}.");
-        long count = 0;
         var sinceLastReport = Stopwatch.StartNew();
         var totalTime = Stopwatch.StartNew();
-        while (reader.Read())
-        {
-            var row = ReadRow(reader, tablesColumns);
-            ProcessRow(row, columnsToProcess);
-            WriteRow(row, table.Table, tablesColumns, destinationConnection);
 
-            count += 1;
-            if (sinceLastReport.Elapsed.TotalSeconds > 10)
-            {
-                Console.WriteLine($"Processing {table.Table} for {totalTime.Elapsed.TotalSeconds}s at row number {count}.");
-                sinceLastReport.Restart();
-            }
-        }
+        var rows = new List<Dictionary<string, object>>();
+
+        var readerChannel = Channel.CreateUnbounded<List<Dictionary<string, object>>>(new UnboundedChannelOptions
+        {
+            SingleReader = false,
+            SingleWriter = true
+        });
+
+        var writerChanel = Channel.CreateUnbounded<List<Dictionary<string, object>>>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false
+        });
+
+        var cts = new CancellationTokenSource();
+        var token = cts.Token;
+
+        var readerTask = Task.Run(() => BackgroundReaderRowsService(reader, tablesColumns, readerChannel, token));
+        var processorTask = Task.Run(() => BackgroundProcessRowsService(readerChannel, writerChanel, columnsToProcess, token));
+        var writerTask = Task.Run(() => BackgroundWriteRowsService(writerChanel, table.Table, tablesColumns, destinationConnection, sinceLastReport, totalTime, token));
+
+        await Task.WhenAll(readerTask, processorTask, writerTask);
+
         Console.WriteLine($"Table {table} processed in: " + totalTime.Elapsed.TotalSeconds + "s");
+    }    
+
+    private static async Task BackgroundReaderRowsService(
+        NpgsqlDataReader reader, ImmutableArray<NpgsqlDbColumn> tablesColumns, Channel<List<Dictionary<string, object>>> readerChannel, CancellationToken token)
+    {
+        int batchSize = 500;
+        var endOfRead = false;
+
+        while (!endOfRead)
+        {
+            var batchOfRows = new List<Dictionary<string, object>>();
+
+            for (int i = 0; i < batchSize; i++)
+            {
+                if (!reader.Read())
+                {
+                    endOfRead = true;
+                    break;
+                }
+                batchOfRows.Add(ReadRow(reader, tablesColumns));
+            }
+
+            await readerChannel.Writer.WriteAsync(batchOfRows, token);
+        }
+
+        readerChannel.Writer.Complete();
+    }
+
+    private static async Task BackgroundProcessRowsService(
+        Channel<List<Dictionary<string, object>>> readerChannel,
+        Channel<List<Dictionary<string, object>>> writerChanel,
+        IReadOnlyDictionary<DatabaseColumn,
+        IColumnProcessor> columnsToProcess,
+        CancellationToken token)
+    {
+        await Parallel.ForEachAsync(readerChannel.Reader.ReadAllAsync(token), async (batchOfRows, token) =>
+        {
+            foreach (var row in batchOfRows)
+            {
+                ProcessRow(row, columnsToProcess);
+            }
+            await writerChanel.Writer.WriteAsync(batchOfRows, token);
+        });
+
+        writerChanel.Writer.Complete();
+    }
+
+    private static async Task BackgroundWriteRowsService(
+        Channel<List<Dictionary<string, object>>> writerChanel,
+        DatabaseTable table,
+        ImmutableArray<NpgsqlDbColumn> tablesColumns,
+        NpgsqlConnection destinationConnection,
+        Stopwatch sinceLastReport,
+        Stopwatch totalTime,
+        CancellationToken token)
+    {
+        var rows = new List<Dictionary<string, object>>();
+
+        await foreach (var batchOfRows in writerChanel.Reader.ReadAllAsync())
+        {
+            rows.AddRange(batchOfRows);
+        }
+
+        await WriteRows(rows, table, tablesColumns, destinationConnection, sinceLastReport, totalTime);
     }
 
     private static Dictionary<string, object> ReadRow(NpgsqlDataReader reader, IReadOnlyList<NpgsqlDbColumn> columns)
@@ -103,25 +178,29 @@ static class Program
         }
     }
 
-    private static void WriteRow(Dictionary<string, object> row, DatabaseTable table, IReadOnlyList<NpgsqlDbColumn> columns, NpgsqlConnection destinationConnection)
+    private static async Task WriteRows(IEnumerable<Dictionary<string, object>> rows, DatabaseTable table, IReadOnlyList<NpgsqlDbColumn> columns, NpgsqlConnection destinationConnection, Stopwatch sinceLastReport, Stopwatch totalTime)
     {
-        using var command = destinationConnection.CreateCommand();
-        var parameterNames = string.Join(", ", Enumerable.Range(1, row.Count).Select(x => $"${x}"));
-        command.CommandText = "INSERT INTO " + table + $" VALUES ({parameterNames})";
+        long count = 0;
 
-        foreach (var column in columns)
-        {
-            var parameter = command.CreateParameter();
-            parameter.Value = row[column.ColumnName];
-            command.Parameters.Add(parameter);
-        }
-        command.Prepare();
+        using var writer = destinationConnection.BeginBinaryImport($"COPY {table} ({string.Join(", ", columns.Select(c => c.ColumnName))}) FROM STDIN (FORMAT BINARY)");
 
-        var result = command.ExecuteNonQuery();
-        if (result != 1)
+        foreach (var row in rows)
         {
-            throw new InvalidOperationException("No rows inserted!");
+            writer.StartRow();
+            foreach (var column in columns)
+            {
+                writer.Write(row[column.ColumnName]);
+            }
+
+            count += 1;
+            if (sinceLastReport.Elapsed.TotalSeconds > 10)
+            {
+                Console.WriteLine($"Processing {table.Table} for {totalTime.Elapsed.TotalSeconds}s at row number {count}.");
+                sinceLastReport.Restart();
+            }
         }
+
+        await writer.CompleteAsync();
     }
 
     private static void TruncateDestinationDatabaseTables(IReadOnlyList<TableConfiguration> tablesToProcess, DbConfig destinationDbConfig)
