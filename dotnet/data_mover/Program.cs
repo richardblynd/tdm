@@ -12,6 +12,10 @@ namespace data_mover;
 
 static class Program
 {
+    private static int CHANNEL_CAPACITY = 200_000;
+    private static int MEMORY_CHECK_COUNT = 100_000;
+    private static long MAX_MEMORY_BYTES = 300 * 1024 * 1024; // 300MB
+
     public static async Task<int> Main(string[] args)
     {
         var config = ReadConfig(args);
@@ -69,77 +73,63 @@ static class Program
 
         var rows = new List<Dictionary<string, object>>();
 
-        var readerChannel = Channel.CreateUnbounded<List<Dictionary<string, object>>>(new UnboundedChannelOptions
+        var readerChannel = Channel.CreateBounded<Dictionary<string, object>>(new BoundedChannelOptions(CHANNEL_CAPACITY)
         {
             SingleReader = false,
-            SingleWriter = true
+            SingleWriter = true,
+            AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.Wait
         });
 
-        var writerChanel = Channel.CreateUnbounded<List<Dictionary<string, object>>>(new UnboundedChannelOptions
+        var writerChannel = Channel.CreateBounded<Dictionary<string, object>>(new BoundedChannelOptions(CHANNEL_CAPACITY)
         {
             SingleReader = true,
-            SingleWriter = false
+            SingleWriter = false,
+            AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.Wait
         });
 
         var cts = new CancellationTokenSource();
         var token = cts.Token;
 
         var readerTask = Task.Run(() => BackgroundReaderRowsService(reader, tablesColumns, readerChannel, token));
-        var processorTask = Task.Run(() => BackgroundProcessRowsService(readerChannel, writerChanel, columnsToProcess, token));
-        var writerTask = Task.Run(() => BackgroundWriteRowsService(writerChanel, table.Table, tablesColumns, destinationConnection, sinceLastReport, totalTime, token));
+        var processorTask = Task.Run(() => BackgroundProcessRowsService(readerChannel, writerChannel, columnsToProcess, token));
+        var writerTask = Task.Run(() => BackgroundWriteRowsService(writerChannel, table.Table, tablesColumns, destinationConnection, sinceLastReport, totalTime, token));
 
         await Task.WhenAll(readerTask, processorTask, writerTask);
 
         Console.WriteLine($"Table {table} processed in: " + totalTime.Elapsed.TotalSeconds + "s");
-    }    
+    }
 
     private static async Task BackgroundReaderRowsService(
-        NpgsqlDataReader reader, ImmutableArray<NpgsqlDbColumn> tablesColumns, Channel<List<Dictionary<string, object>>> readerChannel, CancellationToken token)
+        NpgsqlDataReader reader, ImmutableArray<NpgsqlDbColumn> tablesColumns, Channel<Dictionary<string, object>> readerChannel, CancellationToken token)
     {
-        int batchSize = 500;
-        var endOfRead = false;
-
-        while (!endOfRead)
+        while (reader.Read())
         {
-            var batchOfRows = new List<Dictionary<string, object>>();
-
-            for (int i = 0; i < batchSize; i++)
-            {
-                if (!reader.Read())
-                {
-                    endOfRead = true;
-                    break;
-                }
-                batchOfRows.Add(ReadRow(reader, tablesColumns));
-            }
-
-            await readerChannel.Writer.WriteAsync(batchOfRows, token);
+            await readerChannel.Writer.WriteAsync(ReadRow(reader, tablesColumns), token);
         }
 
         readerChannel.Writer.Complete();
     }
 
     private static async Task BackgroundProcessRowsService(
-        Channel<List<Dictionary<string, object>>> readerChannel,
-        Channel<List<Dictionary<string, object>>> writerChanel,
+        Channel<Dictionary<string, object>> readerChannel,
+        Channel<Dictionary<string, object>> writerChannel,
         IReadOnlyDictionary<DatabaseColumn,
         IColumnProcessor> columnsToProcess,
         CancellationToken token)
     {
-        await Parallel.ForEachAsync(readerChannel.Reader.ReadAllAsync(token), async (batchOfRows, token) =>
+        await Parallel.ForEachAsync(readerChannel.Reader.ReadAllAsync(token), async (row, token) =>
         {
-            foreach (var row in batchOfRows)
-            {
-                ProcessRow(row, columnsToProcess);
-            }
-            await writerChanel.Writer.WriteAsync(batchOfRows, token);
+            ProcessRow(row, columnsToProcess);
+            await writerChannel.Writer.WriteAsync(row, token);
         });
-
-        writerChanel.Writer.Complete();
+        
+        writerChannel.Writer.Complete();
     }
 
     private static async Task BackgroundWriteRowsService(
-        Channel<List<Dictionary<string, object>>> writerChanel,
+        Channel<Dictionary<string, object>> writerChannel,
         DatabaseTable table,
         ImmutableArray<NpgsqlDbColumn> tablesColumns,
         NpgsqlConnection destinationConnection,
@@ -147,14 +137,30 @@ static class Program
         Stopwatch totalTime,
         CancellationToken token)
     {
-        var rows = new List<Dictionary<string, object>>();
+        var count = 0;
+        var rows = new List<Dictionary<string, object>>();        
 
-        await foreach (var batchOfRows in writerChanel.Reader.ReadAllAsync())
-        {
-            rows.AddRange(batchOfRows);
+        await foreach (var row in writerChannel.Reader.ReadAllAsync())
+        {            
+            rows.Add(row);
+            count += 1;
+
+            if (count > MEMORY_CHECK_COUNT)
+            {
+                count = 0;
+                long memoryUsed = GC.GetTotalMemory(true);
+                if (memoryUsed > MAX_MEMORY_BYTES)
+                {
+                    await WriteRows(rows, table, tablesColumns, destinationConnection, sinceLastReport, totalTime);
+                    rows.Clear();
+                }
+            }
         }
 
-        await WriteRows(rows, table, tablesColumns, destinationConnection, sinceLastReport, totalTime);
+        if (rows.Count > 0)
+        {
+            await WriteRows(rows, table, tablesColumns, destinationConnection, sinceLastReport, totalTime);
+        }
     }
 
     private static Dictionary<string, object> ReadRow(NpgsqlDataReader reader, IReadOnlyList<NpgsqlDbColumn> columns)
